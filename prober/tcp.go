@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"syscall"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -31,7 +32,8 @@ import (
 
 func dialTCP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger log.Logger) (net.Conn, error) {
 	var dialProtocol, dialTarget string
-	dialer := &net.Dialer{}
+	var conn syscall.RawConn
+
 	targetAddress, port, err := net.SplitHostPort(target)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error splitting target address and port", "err", err)
@@ -50,6 +52,10 @@ func dialTCP(ctx context.Context, target string, module config.Module, registry 
 		dialProtocol = "tcp4"
 	}
 
+	dialTarget = net.JoinHostPort(ip.String(), port)
+
+	dialer := setupDialer(dialProtocol, dialTarget, conn, module, logger)
+
 	if len(module.TCP.SourceIPAddress) > 0 {
 		srcIP := net.ParseIP(module.TCP.SourceIPAddress)
 		if srcIP == nil {
@@ -59,8 +65,6 @@ func dialTCP(ctx context.Context, target string, module config.Module, registry 
 		level.Info(logger).Log("msg", "Using local address", "srcIP", srcIP)
 		dialer.LocalAddr = &net.TCPAddr{IP: srcIP}
 	}
-
-	dialTarget = net.JoinHostPort(ip.String(), port)
 
 	if !module.TCP.TLS {
 		level.Info(logger).Log("msg", "Dialing TCP without TLS")
