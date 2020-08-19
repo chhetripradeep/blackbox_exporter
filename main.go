@@ -16,8 +16,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"html"
+	"io/ioutil"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -51,13 +54,18 @@ var (
 		C: &config.Config{},
 	}
 
-	configFile    = kingpin.Flag("config.file", "Blackbox exporter configuration file.").Default("blackbox.yml").String()
-	listenAddress = kingpin.Flag("web.listen-address", "The address to listen on for HTTP requests.").Default(":9115").String()
-	timeoutOffset = kingpin.Flag("timeout-offset", "Offset to subtract from timeout in seconds.").Default("0.5").Float64()
-	configCheck   = kingpin.Flag("config.check", "If true validate the config file and then exit.").Default().Bool()
-	historyLimit  = kingpin.Flag("history.limit", "The maximum amount of items to keep in the history.").Default("100").Uint()
-	externalURL   = kingpin.Flag("web.external-url", "The URL under which Blackbox exporter is externally reachable (for example, if Blackbox exporter is served via a reverse proxy). Used for generating relative and absolute links back to Blackbox exporter itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Blackbox exporter. If omitted, relevant URL components will be derived automatically.").PlaceHolder("<url>").String()
-	routePrefix   = kingpin.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to path of --web.external-url.").PlaceHolder("<path>").String()
+	configFile       = kingpin.Flag("config.file", "Blackbox exporter configuration file.").Default("blackbox.yml").String()
+	enableHttp       = kingpin.Flag("enable.http", "If true listens on http address otherwise not").Default("true").Bool()
+	listenAddress    = kingpin.Flag("web.listen-address", "The address to listen on for HTTP requests.").Default(":9115").String()
+	timeoutOffset    = kingpin.Flag("timeout-offset", "Offset to subtract from timeout in seconds.").Default("0.5").Float64()
+	configCheck      = kingpin.Flag("config.check", "If true validate the config file and then exit.").Default().Bool()
+	historyLimit     = kingpin.Flag("history.limit", "The maximum amount of items to keep in the history.").Default("100").Uint()
+	externalURL      = kingpin.Flag("web.external-url", "The URL under which Blackbox exporter is externally reachable (for example, if Blackbox exporter is served via a reverse proxy). Used for generating relative and absolute links back to Blackbox exporter itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Blackbox exporter. If omitted, relevant URL components will be derived automatically.").PlaceHolder("<url>").String()
+	routePrefix      = kingpin.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to path of --web.external-url.").PlaceHolder("<path>").String()
+	enableTls        = kingpin.Flag("enable.tls", "If true listens on tls address otherwise not").Default("false").Bool()
+	listenAddressTls = kingpin.Flag("web.listen-address-tls", "The address to listen on for HTTPS requests.").Default(":9116").String()
+	tlsCert          = kingpin.Flag("tls.cert", "Path to the TLS certificate file").Default("").String()
+	tlsKey           = kingpin.Flag("tls.key", "Path to the TLS key file").Default("").String()
 
 	Probers = map[string]prober.ProbeFn{
 		"http": prober.ProbeHTTP,
@@ -365,13 +373,49 @@ func run() int {
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
 
-	go func() {
-		level.Info(logger).Log("msg", "Listening on address", "address", *listenAddress)
-		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-			level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
-			close(srvc)
+	if *enableHttp {
+		go func() {
+			level.Info(logger).Log("msg", "Listening on address", "address", *listenAddress)
+			if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+				level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
+				close(srvc)
+			}
+		}()
+	}
+
+	var srvTlsc chan struct{}
+
+	if *enableTls && len(*listenAddressTls) > 0 {
+		srvTlsc = make(chan struct{})
+
+		// Create a CA certificate pool and add the cert chain as the intermediate certificate
+		clientCACert, err := ioutil.ReadFile(*tlsCert)
+		if err != nil {
+			level.Error(logger).Log("msg", "Error reading cert file", "err", err)
+			close(srvTlsc)
 		}
-	}()
+
+		clientCertPool := x509.NewCertPool()
+		clientCertPool.AppendCertsFromPEM(clientCACert)
+
+		tlsConfig := &tls.Config{
+			ClientCAs:  clientCertPool,
+			ClientAuth: tls.RequireAndVerifyClientCert,
+		}
+
+		srvTls := http.Server{
+			Addr:      *listenAddressTls,
+			TLSConfig: tlsConfig,
+		}
+
+		go func() {
+			level.Info(logger).Log("msg", "Listening on TLS address", "address", *listenAddressTls)
+			if err := srvTls.ListenAndServeTLS(*tlsCert, *tlsKey); err != http.ErrServerClosed {
+				level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
+				close(srvTlsc)
+			}
+		}()
+	}
 
 	for {
 		select {
@@ -379,6 +423,8 @@ func run() int {
 			level.Info(logger).Log("msg", "Received SIGTERM, exiting gracefully...")
 			return 0
 		case <-srvc:
+			return 1
+		case <-srvTlsc:
 			return 1
 		}
 	}
