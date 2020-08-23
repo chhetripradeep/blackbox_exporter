@@ -66,6 +66,7 @@ var (
 	listenAddressTls = kingpin.Flag("web.listen-address-tls", "The address to listen on for HTTPS requests.").Default(":9116").String()
 	tlsCert          = kingpin.Flag("tls.cert", "Path to the TLS certificate file").Default("").String()
 	tlsKey           = kingpin.Flag("tls.key", "Path to the TLS key file").Default("").String()
+	caCert           = kingpin.Flag("ca.cert", "Path to the TLS certificate file of the CA").Default("").String()
 
 	Probers = map[string]prober.ProbeFn{
 		"http": prober.ProbeHTTP,
@@ -388,10 +389,15 @@ func run() int {
 	if *enableTls && len(*listenAddressTls) > 0 {
 		srvTlsc = make(chan struct{})
 
-		// Create a CA certificate pool and add the cert chain as the intermediate certificate
-		clientCACert, err := ioutil.ReadFile(*tlsCert)
+		svcCert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 		if err != nil {
-			level.Error(logger).Log("msg", "Error reading cert file", "err", err)
+			level.Error(logger).Log("msg", "Error reading service cert or key file", "err", err)
+		}
+
+		// Create a CA certificate pool and add the cert chain as the intermediate certificate
+		clientCACert, err := ioutil.ReadFile(*caCert)
+		if err != nil {
+			level.Error(logger).Log("msg", "Error reading ca cert file", "err", err)
 			close(srvTlsc)
 		}
 
@@ -399,8 +405,23 @@ func run() int {
 		clientCertPool.AppendCertsFromPEM(clientCACert)
 
 		tlsConfig := &tls.Config{
-			ClientCAs:  clientCertPool,
-			ClientAuth: tls.RequireAndVerifyClientCert,
+			Certificates: []tls.Certificate{svcCert},
+			ClientCAs:    clientCertPool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			// To make sure cert is issued by the CA we expect
+			VerifyConnection: func(cs tls.ConnectionState) error {
+				opts := x509.VerifyOptions{
+					DNSName:       cs.ServerName,
+					Roots:         clientCertPool,
+					Intermediates: x509.NewCertPool(),
+					KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+				}
+				for _, cert := range cs.PeerCertificates[1:] {
+					opts.Intermediates.AddCert(cert)
+				}
+				_, err := cs.PeerCertificates[0].Verify(opts)
+				return err
+			},
 		}
 
 		srvTls := http.Server{
